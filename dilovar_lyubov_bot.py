@@ -105,9 +105,9 @@ RULES_TEXT = "🛑 Числа вводим без букв (просто `500`).
 
 def get_menu_keyboard(user_id):
     if user_id == ADMIN_NOTIFY_ID:
-        return ReplyKeyboardMarkup([["📦 Расходники", "🕐 Упаковка"], ["📊 Отчёт за период", "💵 Мой оклад"], ["❓ Помощь"]], resize_keyboard=True)
+        return ReplyKeyboardMarkup([["📦 Расходники", "👤 Сотрудники"], ["📊 Отчёт за период", "💵 Мой оклад"], ["❓ Помощь"]], resize_keyboard=True)
     if user_id == DILOVAR_ID:
-        return ReplyKeyboardMarkup([["📦 Расходники", "🕐 Упаковка"], ["❓ Помощь"]], resize_keyboard=True)
+        return ReplyKeyboardMarkup([["📦 Расходники", "👤 Сотрудники"], ["❓ Помощь"]], resize_keyboard=True)
     if user_id == LYUBOV_ID:
         return ReplyKeyboardMarkup([["📊 Отчёт за период", "💵 Мой оклад"], ["❓ Помощь"]], resize_keyboard=True)
     return None
@@ -143,6 +143,15 @@ SUPPLY_PRICE = "SUPPLY_PRICE"
 SUPPLY_ADD_MORE = "SUPPLY_ADD_MORE"
 SUPPLY_COMMENT = "SUPPLY_COMMENT"
 SUPPLY_CONFIRM = "SUPPLY_CONFIRM"
+EMP_MENU = "EMP_MENU"
+SHIFT_EMPLOYEE = "SHIFT_EMPLOYEE"
+SHIFT_DATE = "SHIFT_DATE"
+SHIFT_START = "SHIFT_START"
+SHIFT_END = "SHIFT_END"
+SHIFT_CONFIRM = "SHIFT_CONFIRM"
+ACCRUAL_EMPLOYEE = "ACCRUAL_EMPLOYEE"
+ACCRUAL_AMOUNT = "ACCRUAL_AMOUNT"
+ACCRUAL_CONFIRM = "ACCRUAL_CONFIRM"
 PACK_EMPLOYEE = "PACK_EMPLOYEE"
 PACK_DATE = "PACK_DATE"
 PACK_UNITS = "PACK_UNITS"
@@ -308,6 +317,189 @@ async def supply_confirm(update, context):
     await update.message.reply_text(f"✅ Занесено: {len(d['s_items'])} поз. на {total}₽.", reply_markup=get_menu_keyboard(update.effective_user.id))
     if ADMIN_NOTIFY_ID:
         await context.bot.send_message(chat_id=ADMIN_NOTIFY_ID, text=f"📦 Диловар внёс закупку расходников: {total}₽ ({d['s_supplier']})")
+    return ConversationHandler.END
+
+
+# --- СОТРУДНИКИ (меню-развилка) ---
+async def employee_menu_start(update, context):
+    kb = [["🕐 Внести смену", "📦 Упаковка (норма)"], ["💵 Начислить оклад"], ["❌ Главное меню"]]
+    await update.message.reply_text("👤 Сотрудники — что делаем?", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
+    return EMP_MENU
+
+
+async def employee_menu_router(update, context):
+    t = update.message.text.strip()
+    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    db = context.bot_data["db"]
+
+    if t == "🕐 Внести смену":
+        emps = db.get_hourly_employees()
+        if not emps:
+            await update.message.reply_text("Нет сотрудников с почасовой ставкой.", reply_markup=get_menu_keyboard(update.effective_user.id))
+            return ConversationHandler.END
+        context.user_data["shift_employees"] = {e["name"]: e for e in emps}
+        await update.message.reply_text("Выберите сотрудника:", reply_markup=build_grid(list(context.user_data["shift_employees"].keys())))
+        return SHIFT_EMPLOYEE
+
+    elif t == "📦 Упаковка (норма)":
+        return await pack_start(update, context)
+
+    elif t == "💵 Начислить оклад":
+        emps = db.get_suppliers_list(type_filter="сотрудник")
+        context.user_data["accrual_employees"] = {e["name"]: e["id"] for e in emps}
+        await update.message.reply_text("Выберите сотрудника:", reply_markup=build_grid(list(context.user_data["accrual_employees"].keys())))
+        return ACCRUAL_EMPLOYEE
+
+    return EMP_MENU
+
+
+# --- Внести смену (гибкое время, как в основном боте) ---
+def parse_flexible_time(text):
+    raw = text.strip().replace(" ", "")
+    if ":" in raw:
+        try:
+            datetime.strptime(raw, "%H:%M"); return raw
+        except ValueError:
+            return None
+    if not raw.isdigit(): return None
+    if len(raw) <= 2: h, m = int(raw), 0
+    elif len(raw) == 3: h, m = int(raw[0]), int(raw[1:3])
+    elif len(raw) == 4: h, m = int(raw[0:2]), int(raw[2:4])
+    else: return None
+    if not (0 <= h <= 23 and 0 <= m <= 59): return None
+    return f"{h:02d}:{m:02d}"
+
+
+MEAL_COMP_HOURS_THRESHOLD = 8
+MEAL_COMP_AMOUNT = 350
+
+
+async def shift_employee(update, context):
+    t = update.message.text.strip()
+    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    employees = context.user_data.get("shift_employees", {})
+    if t not in employees: return SHIFT_EMPLOYEE
+    emp = employees[t]
+    context.user_data["shift_emp_name"] = t
+    context.user_data["shift_emp_id"] = emp["id"]
+    context.user_data["shift_emp_rate"] = float(emp["hourly_rate"])
+    kb = [["Сегодня", "Вчера"], ["🔙 Назад", "❌ Главное меню"]]
+    await update.message.reply_text("Дата смены (Сегодня/Вчера или число):", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
+    return SHIFT_DATE
+
+
+async def shift_date(update, context):
+    t = update.message.text.strip()
+    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    if t == "🔙 Назад": return await employee_menu_start(update, context)
+    parsed = parse_flexible_date(t, TZ_MSK)
+    if not parsed:
+        await update.message.reply_text("⚠️ Не понял дату. Попробуйте ещё раз:")
+        return SHIFT_DATE
+    context.user_data["shift_date_iso"], context.user_data["shift_date_display"] = parsed
+    await update.message.reply_text("Время начала смены (например 9 или 900):", reply_markup=get_step_keyboard())
+    return SHIFT_START
+
+
+async def shift_start(update, context):
+    t = update.message.text.strip()
+    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    parsed = parse_flexible_time(t)
+    if not parsed:
+        await update.message.reply_text("⚠️ Не понял время. Попробуйте ещё раз (например 9 или 900):")
+        return SHIFT_START
+    context.user_data["shift_start_time"] = parsed
+    await update.message.reply_text("Время окончания смены (например 21 или 2100):", reply_markup=get_step_keyboard())
+    return SHIFT_END
+
+
+async def shift_end(update, context):
+    t = update.message.text.strip()
+    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    parsed = parse_flexible_time(t)
+    if not parsed:
+        await update.message.reply_text("⚠️ Не понял время. Попробуйте ещё раз (например 21 или 2100):")
+        return SHIFT_END
+
+    d = context.user_data
+    t_start = datetime.strptime(d["shift_start_time"], "%H:%M")
+    t_end = datetime.strptime(parsed, "%H:%M")
+    hours = (t_end - t_start).total_seconds() / 3600
+    if hours <= 0: hours += 24
+    rate = d["shift_emp_rate"]
+    meal = MEAL_COMP_AMOUNT if hours >= MEAL_COMP_HOURS_THRESHOLD else 0
+    total = round(hours * rate + meal, 2)
+    d["shift_end_time"] = parsed
+    d["shift_hours"] = round(hours, 2)
+    d["shift_total"] = total
+
+    meal_line = f"\n🍽 Обед: +{meal}₽" if meal else ""
+    text = f"🕐 {d['shift_emp_name']}: {d['shift_date_display']} {d['shift_start_time']}–{parsed} ({d['shift_hours']}ч){meal_line}\n💰 Итого: {total}₽"
+    await update.message.reply_text(text, reply_markup=ReplyKeyboardMarkup([["✅ Подтвердить"], ["❌ Главное меню"]], resize_keyboard=True))
+    return SHIFT_CONFIRM
+
+
+async def shift_confirm(update, context):
+    t = update.message.text.strip()
+    if t != "✅ Подтвердить": return await cancel_to_menu(update, context)
+    db, d = context.bot_data["db"], context.user_data
+    category_id = db.get_category_id("Зарплата")
+    comment = f"Смена {d['shift_date_display']} {d['shift_start_time']}–{d['shift_end_time']} ({d['shift_hours']}ч), внёс Диловар"
+    op_id = db.add_operation_returning_id(
+        operation_date=d["shift_date_iso"], ip_id=None, counterparty_id=d["shift_emp_id"],
+        category_id=category_id, operation_type="начисление", amount=d["shift_total"],
+        entered_by=f"dilovar_{update.effective_user.id}", status="confirmed", payment_method=None, comment=comment,
+    )
+    db.post_journal_entry(operation_id=op_id, entry_date=d["shift_date_iso"], debit_code="5100", credit_code="2100",
+                           amount=d["shift_total"], comment=f"Начисление {d['shift_emp_name']} (смена)")
+    await update.message.reply_text(f"✅ Начислено {d['shift_total']}₽ для {d['shift_emp_name']}.", reply_markup=get_menu_keyboard(update.effective_user.id))
+    if ADMIN_NOTIFY_ID:
+        await context.bot.send_message(chat_id=ADMIN_NOTIFY_ID, text=f"🕐 Диловар внёс смену {d['shift_emp_name']}: {d['shift_date_display']} {d['shift_start_time']}–{d['shift_end_time']} → {d['shift_total']}₽")
+    return ConversationHandler.END
+
+
+# --- Начислить оклад (фикс. сумма любому сотруднику) ---
+async def accrual_employee(update, context):
+    t = update.message.text.strip()
+    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    employees = context.user_data.get("accrual_employees", {})
+    if t not in employees: return ACCRUAL_EMPLOYEE
+    context.user_data["accrual_emp_name"] = t
+    context.user_data["accrual_emp_id"] = employees[t]
+    await update.message.reply_text("Сумма (₽):", reply_markup=get_step_keyboard())
+    return ACCRUAL_AMOUNT
+
+
+async def accrual_amount(update, context):
+    t = update.message.text.strip()
+    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    try: amount = float(t.replace(",", ".").replace(" ", ""))
+    except ValueError:
+        await update.message.reply_text("⚠️ Нужно число. Попробуйте ещё раз:", reply_markup=get_step_keyboard())
+        return ACCRUAL_AMOUNT
+    context.user_data["accrual_amount"] = amount
+    d = context.user_data
+    await update.message.reply_text(f"💵 Начислить {d['accrual_emp_name']}: {amount}₽?", reply_markup=ReplyKeyboardMarkup([["✅ Подтвердить"], ["❌ Главное меню"]], resize_keyboard=True))
+    return ACCRUAL_CONFIRM
+
+
+async def accrual_confirm(update, context):
+    t = update.message.text.strip()
+    if t != "✅ Подтвердить": return await cancel_to_menu(update, context)
+    db, d = context.bot_data["db"], context.user_data
+    category_id = db.get_category_id("Зарплата")
+    op_date = datetime.now(TZ_MSK).date().isoformat()
+    op_id = db.add_operation_returning_id(
+        operation_date=op_date, ip_id=None, counterparty_id=d["accrual_emp_id"],
+        category_id=category_id, operation_type="начисление", amount=d["accrual_amount"],
+        entered_by=f"dilovar_{update.effective_user.id}", status="confirmed", payment_method=None,
+        comment=f"Начисление оклада (внёс Диловар)",
+    )
+    db.post_journal_entry(operation_id=op_id, entry_date=op_date, debit_code="5100", credit_code="2100",
+                           amount=d["accrual_amount"], comment=f"Начисление {d['accrual_emp_name']}")
+    await update.message.reply_text(f"✅ Начислено {d['accrual_amount']}₽ для {d['accrual_emp_name']}.", reply_markup=get_menu_keyboard(update.effective_user.id))
+    if ADMIN_NOTIFY_ID:
+        await context.bot.send_message(chat_id=ADMIN_NOTIFY_ID, text=f"💵 Диловар начислил {d['accrual_emp_name']}: {d['accrual_amount']}₽")
     return ConversationHandler.END
 
 
@@ -497,29 +689,38 @@ def main():
             SUPPLY_ADD_MORE: [MessageHandler(filters.TEXT & ~filters.COMMAND, supply_add_more)],
             SUPPLY_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, supply_comment)],
             SUPPLY_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, supply_confirm)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Расходники|🕐 Упаковка|📊 Отчёт за период|💵 Мой оклад)$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Расходники|👤 Сотрудники|📊 Отчёт за период|💵 Мой оклад)$"), cancel_to_menu)]
     )
 
     pack_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^🕐 Упаковка$"), pack_start)],
+        entry_points=[MessageHandler(filters.Regex("^👤 Сотрудники$"), employee_menu_start)],
         states={
+            EMP_MENU: [MessageHandler(filters.TEXT & ~filters.COMMAND, employee_menu_router)],
             PACK_EMPLOYEE: [MessageHandler(filters.TEXT & ~filters.COMMAND, pack_employee)],
             PACK_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, pack_date)],
             PACK_UNITS: [MessageHandler(filters.TEXT & ~filters.COMMAND, pack_units)],
             PACK_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, pack_confirm)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Расходники|🕐 Упаковка|📊 Отчёт за период|💵 Мой оклад)$"), cancel_to_menu)]
+            SHIFT_EMPLOYEE: [MessageHandler(filters.TEXT & ~filters.COMMAND, shift_employee)],
+            SHIFT_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, shift_date)],
+            SHIFT_START: [MessageHandler(filters.TEXT & ~filters.COMMAND, shift_start)],
+            SHIFT_END: [MessageHandler(filters.TEXT & ~filters.COMMAND, shift_end)],
+            SHIFT_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, shift_confirm)],
+            ACCRUAL_EMPLOYEE: [MessageHandler(filters.TEXT & ~filters.COMMAND, accrual_employee)],
+            ACCRUAL_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, accrual_amount)],
+            ACCRUAL_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, accrual_confirm)],
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Расходники|👤 Сотрудники|📊 Отчёт за период|💵 Мой оклад)$"), cancel_to_menu)]
     )
 
     report_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^📊 Отчёт за период$"), report_start)],
         states={REPORT_PERIOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, report_period)]},
-        fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Расходники|🕐 Упаковка|📊 Отчёт за период|💵 Мой оклад)$"), cancel_to_menu)]
+        fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Расходники|👤 Сотрудники|📊 Отчёт за период|💵 Мой оклад)$"), cancel_to_menu)]
     )
 
     salary_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^💵 Мой оклад$"), salary_start)],
         states={SALARY_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, salary_confirm)]},
-        fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Расходники|🕐 Упаковка|📊 Отчёт за период|💵 Мой оклад)$"), cancel_to_menu)]
+        fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Расходники|👤 Сотрудники|📊 Отчёт за период|💵 Мой оклад)$"), cancel_to_menu)]
     )
 
     application.add_handler(CommandHandler("start", start))
