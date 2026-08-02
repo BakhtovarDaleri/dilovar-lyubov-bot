@@ -204,13 +204,22 @@ async def supply_start(update, context):
     return SUPPLY_SUPPLIER
 
 
+SHAHBOZ_ITEMS = ["Банановая коробка", "Европаддон"]
+
+
 async def supply_supplier(update, context):
     t = update.message.text.strip()
     if t == "❌ Главное меню": return await cancel_to_menu(update, context)
     if t == "🔙 Назад": return await supply_start(update, context)
     context.user_data["s_supplier"] = t
     db = context.bot_data["db"]
-    items = db.get_consumables_list()
+    all_items = db.get_consumables_list()
+
+    if "Шахбоз" in t:
+        items = [i for i in all_items if any(s in i for s in SHAHBOZ_ITEMS)]
+    else:
+        items = [i for i in all_items if not any(s in i for s in SHAHBOZ_ITEMS)]
+
     await update.message.reply_text("Шаг 2: Выберите товар:", reply_markup=build_grid(items))
     return SUPPLY_PRODUCT
 
@@ -229,7 +238,13 @@ async def supply_qty(update, context):
     if t == "❌ Главное меню": return await cancel_to_menu(update, context)
     if t == "🔙 Назад":
         db = context.bot_data["db"]
-        await update.message.reply_text("Шаг 2: Выберите товар:", reply_markup=build_grid(db.get_consumables_list()))
+        supplier = context.user_data.get("s_supplier", "")
+        all_items = db.get_consumables_list()
+        if "Шахбоз" in supplier:
+            items = [i for i in all_items if any(s in i for s in SHAHBOZ_ITEMS)]
+        else:
+            items = [i for i in all_items if not any(s in i for s in SHAHBOZ_ITEMS)]
+        await update.message.reply_text("Шаг 2: Выберите товар:", reply_markup=build_grid(items))
         return SUPPLY_PRODUCT
     try: context.user_data["s_cur_qty"] = float(t.replace(",", "."))
     except ValueError:
@@ -270,7 +285,13 @@ async def supply_add_more(update, context):
         return SUPPLY_PRICE
     if t == "➕ Добавить ещё":
         db = context.bot_data["db"]
-        await update.message.reply_text("Выберите товар:", reply_markup=build_grid(db.get_consumables_list()))
+        supplier = context.user_data.get("s_supplier", "")
+        all_items = db.get_consumables_list()
+        if "Шахбоз" in supplier:
+            items = [i for i in all_items if any(s in i for s in SHAHBOZ_ITEMS)]
+        else:
+            items = [i for i in all_items if not any(s in i for s in SHAHBOZ_ITEMS)]
+        await update.message.reply_text("Выберите товар:", reply_markup=build_grid(items))
         return SUPPLY_PRODUCT
     if t == "✅ Это всё":
         await update.message.reply_text("Комментарий (или '-'):", reply_markup=get_step_keyboard())
