@@ -121,7 +121,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     kb = get_menu_keyboard(uid)
     if not kb:
-        await update.message.reply_text("🔒 У вас нет доступа к этому боту.")
+        await update.message.reply_text(
+            f"🔒 У вас нет доступа к этому боту.\n\n"
+            f"Ваш ID: `{uid}`\n\n"
+            f"Перешлите этот номер администратору — он добавит вас.",
+            parse_mode="Markdown",
+        )
         return
     await update.message.reply_text(f"👋 Добро пожаловать!\n\n{RULES_TEXT}", reply_markup=kb, parse_mode="Markdown")
 
