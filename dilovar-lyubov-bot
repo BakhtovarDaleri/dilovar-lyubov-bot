@@ -170,7 +170,6 @@ PACK_UNITS = "PACK_UNITS"
 PACK_CONFIRM = "PACK_CONFIRM"
 REPORT_PERIOD = "REPORT_PERIOD"
 SALARY_CONFIRM = "SALARY_CONFIRM"
-PAY_TYPE = "PAY_TYPE"
 PAY_SUPPLIER = "PAY_SUPPLIER"
 PAY_AMOUNT = "PAY_AMOUNT"
 PAY_METHOD = "PAY_METHOD"
@@ -715,23 +714,10 @@ async def salary_confirm(update, context):
 
 # --- ОПЛАТА (фактическая выплата — уменьшает долг) ---
 async def payment_start(update, context):
-    kb = [["📦 Расходники (поставщик)", "👤 Сотрудник"], ["❌ Главное меню"]]
-    await update.message.reply_text("💰 Кому платим?", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
-    return PAY_TYPE
-
-
-async def payment_type(update, context):
-    t = update.message.text.strip()
-    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
     db = context.bot_data["db"]
-    if t == "📦 Расходники (поставщик)":
-        context.user_data["pay_cp_type"] = "поставщик расходников"
-    elif t == "👤 Сотрудник":
-        context.user_data["pay_cp_type"] = "сотрудник"
-    else:
-        return PAY_TYPE
-    sups = [s["name"] for s in db.get_suppliers_list(type_filter=context.user_data["pay_cp_type"])]
-    await update.message.reply_text("Выберите получателя:", reply_markup=build_grid(sups))
+    context.user_data["pay_cp_type"] = "поставщик расходников"
+    sups = [s["name"] for s in db.get_suppliers_list(type_filter="поставщик расходников")]
+    await update.message.reply_text("💰 Кому платим:", reply_markup=build_grid(sups))
     return PAY_SUPPLIER
 
 
@@ -864,7 +850,6 @@ def main():
     payment_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^💰 Оплата$"), payment_start)],
         states={
-            PAY_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, payment_type)],
             PAY_SUPPLIER: [MessageHandler(filters.TEXT & ~filters.COMMAND, payment_supplier)],
             PAY_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, payment_amount)],
             PAY_METHOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, payment_method)],
