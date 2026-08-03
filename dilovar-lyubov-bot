@@ -86,6 +86,13 @@ class SupabaseService:
     def add_warehouse_movement(self, **fields):
         self.client.table("warehouse_movements").insert(fields).execute()
 
+    def get_supplier_current_debt(self, supplier_name: str) -> float:
+        cp = self.get_counterparty_by_name(supplier_name)
+        if not cp:
+            return 0.0
+        res = self.client.table("operations").select("amount").eq("counterparty_id", cp["id"]).execute()
+        return round(sum(float(r["amount"]) for r in (res.data or [])), 2)
+
     def get_hourly_employees(self):
         res = self.client.table("counterparties").select("id,name,hourly_rate").eq("type", "сотрудник").not_.is_("hourly_rate", "null").order("name").execute()
         return res.data or []
@@ -105,9 +112,9 @@ RULES_TEXT = "🛑 Числа вводим без букв (просто `500`).
 
 def get_menu_keyboard(user_id):
     if user_id == ADMIN_NOTIFY_ID:
-        return ReplyKeyboardMarkup([["📦 Расходники", "👤 Сотрудники"], ["📊 Отчёт за период", "💵 Мой оклад"], ["❓ Помощь"]], resize_keyboard=True)
+        return ReplyKeyboardMarkup([["📦 Расходники", "👤 Сотрудники"], ["💰 Оплата", "📊 Отчёт за период"], ["💵 Мой оклад", "❓ Помощь"]], resize_keyboard=True)
     if user_id == DILOVAR_ID:
-        return ReplyKeyboardMarkup([["📦 Расходники", "👤 Сотрудники"], ["❓ Помощь"]], resize_keyboard=True)
+        return ReplyKeyboardMarkup([["📦 Расходники", "👤 Сотрудники"], ["💰 Оплата"], ["❓ Помощь"]], resize_keyboard=True)
     if user_id == LYUBOV_ID:
         return ReplyKeyboardMarkup([["📊 Отчёт за период", "💵 Мой оклад"], ["❓ Помощь"]], resize_keyboard=True)
     return None
@@ -163,6 +170,12 @@ PACK_UNITS = "PACK_UNITS"
 PACK_CONFIRM = "PACK_CONFIRM"
 REPORT_PERIOD = "REPORT_PERIOD"
 SALARY_CONFIRM = "SALARY_CONFIRM"
+PAY_TYPE = "PAY_TYPE"
+PAY_SUPPLIER = "PAY_SUPPLIER"
+PAY_AMOUNT = "PAY_AMOUNT"
+PAY_METHOD = "PAY_METHOD"
+PAY_COMMENT = "PAY_COMMENT"
+PAY_CONFIRM = "PAY_CONFIRM"
 
 
 def build_grid(items, columns=2):
@@ -700,6 +713,105 @@ async def salary_confirm(update, context):
     return ConversationHandler.END
 
 
+# --- ОПЛАТА (фактическая выплата — уменьшает долг) ---
+async def payment_start(update, context):
+    kb = [["📦 Расходники (поставщик)", "👤 Сотрудник"], ["❌ Главное меню"]]
+    await update.message.reply_text("💰 Кому платим?", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
+    return PAY_TYPE
+
+
+async def payment_type(update, context):
+    t = update.message.text.strip()
+    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    db = context.bot_data["db"]
+    if t == "📦 Расходники (поставщик)":
+        context.user_data["pay_cp_type"] = "поставщик расходников"
+    elif t == "👤 Сотрудник":
+        context.user_data["pay_cp_type"] = "сотрудник"
+    else:
+        return PAY_TYPE
+    sups = [s["name"] for s in db.get_suppliers_list(type_filter=context.user_data["pay_cp_type"])]
+    await update.message.reply_text("Выберите получателя:", reply_markup=build_grid(sups))
+    return PAY_SUPPLIER
+
+
+async def payment_supplier(update, context):
+    t = update.message.text.strip()
+    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    if t == "🔙 Назад": return await payment_start(update, context)
+    db = context.bot_data["db"]
+    context.user_data["pay_supplier"] = t
+    debt = db.get_supplier_current_debt(t)
+    kb = [[f"{debt}"], ["Ввести сумму вручную"], ["🔙 Назад", "❌ Главное меню"]]
+    await update.message.reply_text(f"Текущий долг перед {t}: {debt}₽.\nВыберите сумму или введите вручную:", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
+    return PAY_AMOUNT
+
+
+async def payment_amount(update, context):
+    t = update.message.text.strip()
+    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    if t == "🔙 Назад":
+        db = context.bot_data["db"]
+        sups = [s["name"] for s in db.get_suppliers_list(type_filter=context.user_data["pay_cp_type"])]
+        await update.message.reply_text("Выберите получателя:", reply_markup=build_grid(sups))
+        return PAY_SUPPLIER
+    if t == "Ввести сумму вручную":
+        await update.message.reply_text("Введите сумму цифрами:", reply_markup=get_step_keyboard())
+        return PAY_AMOUNT
+    try: context.user_data["pay_amount"] = float(t.replace(",", ".").replace(" ", ""))
+    except ValueError:
+        await update.message.reply_text("⚠️ Нужно число. Попробуйте ещё раз:", reply_markup=get_step_keyboard())
+        return PAY_AMOUNT
+    kb = [["Наличные", "Карта ВТБ"], ["Безнал ИП"], ["🔙 Назад", "❌ Главное меню"]]
+    await update.message.reply_text("Способ оплаты:", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
+    return PAY_METHOD
+
+
+async def payment_method(update, context):
+    t = update.message.text.strip()
+    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    if t == "🔙 Назад":
+        await update.message.reply_text("Введите сумму цифрами:", reply_markup=get_step_keyboard())
+        return PAY_AMOUNT
+    context.user_data["pay_method"] = t
+    await update.message.reply_text("Комментарий (или '-'):", reply_markup=get_step_keyboard())
+    return PAY_COMMENT
+
+
+async def payment_comment(update, context):
+    t = update.message.text.strip()
+    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    context.user_data["pay_comment"] = t if t != "-" else ""
+    d = context.user_data
+    await update.message.reply_text(
+        f"💰 Платёж:\n{d['pay_supplier']}: {d['pay_amount']}₽\n{d['pay_method']}",
+        reply_markup=ReplyKeyboardMarkup([["✅ Подтвердить"], ["❌ Главное меню"]], resize_keyboard=True))
+    return PAY_CONFIRM
+
+
+async def payment_confirm(update, context):
+    t = update.message.text.strip()
+    if t != "✅ Подтвердить": return await cancel_to_menu(update, context)
+    db, d = context.bot_data["db"], context.user_data
+    cp = db.get_counterparty_by_name(d["pay_supplier"])
+    category_name = "Зарплата" if d["pay_cp_type"] == "сотрудник" else "Расходники (упаковка, скотч, этикетки)"
+    op_date = datetime.now(TZ_MSK).date().isoformat()
+    op_id = db.add_operation_returning_id(
+        operation_date=op_date, ip_id=None, counterparty_id=(cp or {}).get("id"),
+        category_id=db.get_category_id(category_name), operation_type="оплата", amount=-d["pay_amount"],
+        entered_by=f"dilovar_{update.effective_user.id}", status="confirmed",
+        payment_method=d["pay_method"], comment=d["pay_comment"],
+    )
+    payables_code = "2100" if d["pay_cp_type"] == "сотрудник" else "2000"
+    cash_code = "1000" if d["pay_method"] == "Наличные" else "1010"
+    db.post_journal_entry(operation_id=op_id, entry_date=op_date, debit_code=payables_code, credit_code=cash_code,
+                           amount=d["pay_amount"], comment=f"Оплата: {d['pay_supplier']} ({d['pay_method']}), внёс Диловар")
+    await update.message.reply_text("✅ Оплата сохранена.", reply_markup=get_menu_keyboard(update.effective_user.id))
+    if ADMIN_NOTIFY_ID:
+        await context.bot.send_message(chat_id=ADMIN_NOTIFY_ID, text=f"💰 Диловар внёс оплату: {d['pay_supplier']} — {d['pay_amount']}₽ ({d['pay_method']})")
+    return ConversationHandler.END
+
+
 def main():
     db_service = SupabaseService()
     application = Application.builder().token(BOT_TOKEN).build()
@@ -715,7 +827,7 @@ def main():
             SUPPLY_ADD_MORE: [MessageHandler(filters.TEXT & ~filters.COMMAND, supply_add_more)],
             SUPPLY_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, supply_comment)],
             SUPPLY_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, supply_confirm)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Расходники|👤 Сотрудники|📊 Отчёт за период|💵 Мой оклад)$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Расходники|👤 Сотрудники|💰 Оплата|📊 Отчёт за период|💵 Мой оклад)$"), cancel_to_menu)]
     )
 
     pack_conv = ConversationHandler(
@@ -734,24 +846,37 @@ def main():
             ACCRUAL_EMPLOYEE: [MessageHandler(filters.TEXT & ~filters.COMMAND, accrual_employee)],
             ACCRUAL_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, accrual_amount)],
             ACCRUAL_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, accrual_confirm)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Расходники|👤 Сотрудники|📊 Отчёт за период|💵 Мой оклад)$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Расходники|👤 Сотрудники|💰 Оплата|📊 Отчёт за период|💵 Мой оклад)$"), cancel_to_menu)]
     )
 
     report_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^📊 Отчёт за период$"), report_start)],
         states={REPORT_PERIOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, report_period)]},
-        fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Расходники|👤 Сотрудники|📊 Отчёт за период|💵 Мой оклад)$"), cancel_to_menu)]
+        fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Расходники|👤 Сотрудники|💰 Оплата|📊 Отчёт за период|💵 Мой оклад)$"), cancel_to_menu)]
     )
 
     salary_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^💵 Мой оклад$"), salary_start)],
         states={SALARY_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, salary_confirm)]},
-        fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Расходники|👤 Сотрудники|📊 Отчёт за период|💵 Мой оклад)$"), cancel_to_menu)]
+        fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Расходники|👤 Сотрудники|💰 Оплата|📊 Отчёт за период|💵 Мой оклад)$"), cancel_to_menu)]
+    )
+
+    payment_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^💰 Оплата$"), payment_start)],
+        states={
+            PAY_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, payment_type)],
+            PAY_SUPPLIER: [MessageHandler(filters.TEXT & ~filters.COMMAND, payment_supplier)],
+            PAY_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, payment_amount)],
+            PAY_METHOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, payment_method)],
+            PAY_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, payment_comment)],
+            PAY_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, payment_confirm)],
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Расходники|👤 Сотрудники|💰 Оплата|📊 Отчёт за период|💵 Мой оклад)$"), cancel_to_menu)]
     )
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_cmd))
     application.add_handler(supply_conv)
+    application.add_handler(payment_conv)
     application.add_handler(pack_conv)
     application.add_handler(report_conv)
     application.add_handler(salary_conv)
