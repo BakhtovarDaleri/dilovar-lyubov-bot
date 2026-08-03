@@ -220,7 +220,7 @@ async def supply_supplier(update, context):
     db = context.bot_data["db"]
     all_items = db.get_consumables_list()
 
-    if "Шахбоз" in t:
+    if "Шавкат" in t:
         items = [i for i in all_items if any(s in i for s in SHAHBOZ_ITEMS)]
     else:
         items = [i for i in all_items if not any(s in i for s in SHAHBOZ_ITEMS)]
@@ -245,7 +245,7 @@ async def supply_qty(update, context):
         db = context.bot_data["db"]
         supplier = context.user_data.get("s_supplier", "")
         all_items = db.get_consumables_list()
-        if "Шахбоз" in supplier:
+        if "Шавкат" in supplier:
             items = [i for i in all_items if any(s in i for s in SHAHBOZ_ITEMS)]
         else:
             items = [i for i in all_items if not any(s in i for s in SHAHBOZ_ITEMS)]
@@ -292,7 +292,7 @@ async def supply_add_more(update, context):
         db = context.bot_data["db"]
         supplier = context.user_data.get("s_supplier", "")
         all_items = db.get_consumables_list()
-        if "Шахбоз" in supplier:
+        if "Шавкат" in supplier:
             items = [i for i in all_items if any(s in i for s in SHAHBOZ_ITEMS)]
         else:
             items = [i for i in all_items if not any(s in i for s in SHAHBOZ_ITEMS)]
