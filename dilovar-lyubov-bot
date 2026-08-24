@@ -10,9 +10,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from telegram import Update, ReplyKeyboardMarkup
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     ConversationHandler, ContextTypes, filters,
 )
 from supabase import create_client, Client
@@ -24,7 +24,6 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 DILOVAR_ID = int(os.getenv("DILOVAR_ID", "0"))
 LYUBOV_ID = int(os.getenv("LYUBOV_ID", "0"))
 RAHMATJON_ID = int(os.getenv("RAHMATJON_ID", "0"))
-ACCOUNTANT_ID = int(os.getenv("ACCOUNTANT_ID", "0"))
 ADMIN_NOTIFY_ID = int(os.getenv("ADMIN_NOTIFY_ID", "5450770011"))  # Бахтовар — по умолчанию, чтобы точно был доступ
 
 TZ_MSK = zoneinfo.ZoneInfo("Europe/Moscow")
@@ -119,22 +118,60 @@ class SupabaseService:
         )
         return res.data or []
 
-    def get_payments_report_rows(self, date_from, date_to):
+    def get_other_warehouse_expenses_rows(self, exclude_category_ids, date_from, date_to):
+        cat_ids = [
+            c["id"] for c in (self.client.table("categories").select("id").eq("group_name", "склад").execute().data or [])
+            if c["id"] not in exclude_category_ids
+        ]
+        if not cat_ids:
+            return []
         res = (
             self.client.table("operations")
-            .select("operation_date,amount,payment_method,comment,counterparties(name)")
-            .eq("operation_type", "оплата")
+            .select("operation_date,amount,comment,categories(name),counterparties(name)")
+            .in_("category_id", cat_ids)
             .gte("operation_date", date_from).lte("operation_date", date_to)
             .order("operation_date")
             .execute()
         )
         return res.data or []
 
+    # --- Доступ бухгалтера (динамическая заявка, без переменных окружения) ---
+    def get_dynamic_role(self, user_id: int):
+        res = self.client.table("dilovar_bot_pending_users").select("role,status").eq("user_id", user_id).eq("status", "approved").limit(1).execute()
+        data = res.data or []
+        return data[0]["role"] if data else None
+
+    def get_access_request_status(self, user_id: int):
+        res = self.client.table("dilovar_bot_pending_users").select("status").eq("user_id", user_id).limit(1).execute()
+        data = res.data or []
+        return data[0]["status"] if data else None
+
+    def create_access_request(self, user_id: int, name: str, username: str):
+        self.client.table("dilovar_bot_pending_users").insert({
+            "user_id": user_id, "name": name, "username": username, "status": "pending",
+        }).execute()
+
+    def approve_access_request(self, user_id: int, role: str, decided_by: int):
+        self.client.table("dilovar_bot_pending_users").update({
+            "status": "approved", "role": role, "decided_at": datetime.now(TZ_MSK).isoformat(), "decided_by": decided_by,
+        }).eq("user_id", user_id).execute()
+
+    def reject_access_request(self, user_id: int, decided_by: int):
+        self.client.table("dilovar_bot_pending_users").update({
+            "status": "rejected", "decided_at": datetime.now(TZ_MSK).isoformat(), "decided_by": decided_by,
+        }).eq("user_id", user_id).execute()
+
 
 RULES_TEXT = "🛑 Числа вводим без букв (просто `500`).\nКнопка «❌ Главное меню» отменяет любой шаг."
 
 
-def get_menu_keyboard(user_id):
+ACCOUNTANT_KEYBOARD = ReplyKeyboardMarkup(
+    [["🌰 Закупки сырья (отчёт)", "📦 Расходники (отчёт)"], ["💵 Зарплаты (отчёт)", "📉 Прочие расходы (отчёт)"], ["❓ Помощь"]],
+    resize_keyboard=True,
+)
+
+
+def get_menu_keyboard(user_id, db=None):
     if user_id == ADMIN_NOTIFY_ID:
         return ReplyKeyboardMarkup([["📦 Расходники", "👤 Сотрудники"], ["💰 Оплата", "📊 Отчёт за период"], ["💵 Мой оклад", "❓ Помощь"]], resize_keyboard=True)
     if user_id == DILOVAR_ID:
@@ -143,8 +180,8 @@ def get_menu_keyboard(user_id):
         return ReplyKeyboardMarkup([["📦 Расходники", "👤 Сотрудники"], ["💰 Оплата"], ["❓ Помощь"]], resize_keyboard=True)
     if user_id == LYUBOV_ID:
         return ReplyKeyboardMarkup([["📊 Отчёт за период", "💵 Мой оклад"], ["❓ Помощь"]], resize_keyboard=True)
-    if user_id == ACCOUNTANT_ID:
-        return ReplyKeyboardMarkup([["📦 Расходники (отчёт)", "💵 Зарплаты (отчёт)"], ["💰 Оплаты (отчёт)"], ["❓ Помощь"]], resize_keyboard=True)
+    if db is not None and db.get_dynamic_role(user_id) == "accountant":
+        return ACCOUNTANT_KEYBOARD
     return None
 
 
@@ -154,25 +191,66 @@ def get_step_keyboard():
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    kb = get_menu_keyboard(uid)
-    if not kb:
-        await update.message.reply_text(
-            f"🔒 У вас нет доступа к этому боту.\n\n"
-            f"Ваш ID: `{uid}`\n\n"
-            f"Перешлите этот номер администратору — он добавит вас.",
-            parse_mode="Markdown",
-        )
+    db = context.bot_data["db"]
+    kb = get_menu_keyboard(uid, db)
+    if kb:
+        await update.message.reply_text(f"👋 Добро пожаловать!\n\n{RULES_TEXT}", reply_markup=kb, parse_mode="Markdown")
         return
-    await update.message.reply_text(f"👋 Добро пожаловать!\n\n{RULES_TEXT}", reply_markup=kb, parse_mode="Markdown")
+
+    status = db.get_access_request_status(uid)
+    if status == "pending":
+        await update.message.reply_text("⏳ Заявка уже отправлена администратору, ждите подтверждения.")
+        return
+    if status == "rejected":
+        await update.message.reply_text("🔒 Доступ был отклонён администратором. Если это ошибка — обратитесь к нему напрямую.")
+        return
+
+    u = update.effective_user
+    name = f"{u.first_name or ''} {u.last_name or ''}".strip() or "Без имени"
+    username = f"@{u.username}" if u.username else None
+    db.create_access_request(uid, name, username)
+    await update.message.reply_text("⏳ Заявка отправлена администратору, ждите подтверждения.")
+
+    if ADMIN_NOTIFY_ID:
+        kb_admin = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Одобрить как бухгалтер", callback_data=f"db_appr_acc_{uid}"),
+            InlineKeyboardButton("❌ Отклонить", callback_data=f"db_rej_{uid}"),
+        ]])
+        text = f"🔔 Новая заявка на доступ к боту:\n👤 {name}"
+        if username:
+            text += f" ({username})"
+        text += f"\n🆔 ID: `{uid}`"
+        await context.bot.send_message(chat_id=ADMIN_NOTIFY_ID, text=text, reply_markup=kb_admin, parse_mode="Markdown")
+
+
+async def access_request_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if update.effective_user.id != ADMIN_NOTIFY_ID:
+        await query.answer("Только администратор может это делать.", show_alert=True)
+        return
+    await query.answer()
+    db = context.bot_data["db"]
+    data = query.data
+
+    if data.startswith("db_appr_acc_"):
+        target_id = int(data[len("db_appr_acc_"):])
+        db.approve_access_request(target_id, "accountant", update.effective_user.id)
+        await query.edit_message_text(query.message.text_markdown + "\n\n✅ Одобрено как бухгалтер.", parse_mode="Markdown")
+        await context.bot.send_message(chat_id=target_id, text="✅ Доступ открыт! Вы добавлены как бухгалтер.", reply_markup=ACCOUNTANT_KEYBOARD)
+    elif data.startswith("db_rej_"):
+        target_id = int(data[len("db_rej_"):])
+        db.reject_access_request(target_id, update.effective_user.id)
+        await query.edit_message_text(query.message.text_markdown + "\n\n❌ Отклонено.", parse_mode="Markdown")
+        await context.bot.send_message(chat_id=target_id, text="🔒 Ваша заявка на доступ была отклонена.")
 
 
 async def cancel_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Возврат в главное меню.", reply_markup=get_menu_keyboard(update.effective_user.id))
+    await update.message.reply_text("Возврат в главное меню.", reply_markup=get_menu_keyboard(update.effective_user.id, context.bot_data["db"]))
     return ConversationHandler.END
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(RULES_TEXT, reply_markup=get_menu_keyboard(update.effective_user.id), parse_mode="Markdown")
+    await update.message.reply_text(RULES_TEXT, reply_markup=get_menu_keyboard(update.effective_user.id, context.bot_data["db"]), parse_mode="Markdown")
 
 
 # --- STATES ---
@@ -244,7 +322,7 @@ def parse_flexible_date(text, tz):
 
 # --- РАСХОДНИКИ (корзина, как в основном боте) ---
 async def supply_start(update, context):
-    if update.effective_user.id == ACCOUNTANT_ID:
+    if context.bot_data["db"].get_dynamic_role(update.effective_user.id) == "accountant":
         return await cancel_to_menu(update, context)
     context.user_data["s_items"] = []
     db = context.bot_data["db"]
@@ -392,7 +470,7 @@ async def supply_confirm(update, context):
 
 # --- СОТРУДНИКИ (меню-развилка) ---
 async def employee_menu_start(update, context):
-    if update.effective_user.id == ACCOUNTANT_ID:
+    if context.bot_data["db"].get_dynamic_role(update.effective_user.id) == "accountant":
         return await cancel_to_menu(update, context)
     kb = [["🕐 Внести смену", "📦 Упаковка (норма)"], ["💵 Начислить оклад"], ["❌ Главное меню"]]
     await update.message.reply_text("👤 Сотрудники — что делаем?", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
@@ -722,7 +800,7 @@ async def report_period(update, context):
 
 # --- ОКЛАД ЛЮБОВИ ---
 async def salary_start(update, context):
-    if update.effective_user.id == ACCOUNTANT_ID:
+    if context.bot_data["db"].get_dynamic_role(update.effective_user.id) == "accountant":
         return await cancel_to_menu(update, context)
     await update.message.reply_text("💵 Начислить оклад 6 000₽?", reply_markup=ReplyKeyboardMarkup([["✅ Подтвердить"], ["❌ Главное меню"]], resize_keyboard=True))
     return SALARY_CONFIRM
@@ -750,7 +828,7 @@ async def salary_confirm(update, context):
 
 # --- ОПЛАТА (фактическая выплата — уменьшает долг) ---
 async def payment_start(update, context):
-    if update.effective_user.id == ACCOUNTANT_ID:
+    if context.bot_data["db"].get_dynamic_role(update.effective_user.id) == "accountant":
         return await cancel_to_menu(update, context)
     db = context.bot_data["db"]
     context.user_data["pay_cp_type"] = "поставщик расходников"
@@ -838,9 +916,10 @@ async def payment_confirm(update, context):
 
 # --- ОТЧЁТЫ ДЛЯ БУХГАЛТЕРА (read-only, без внесения данных) ---
 ACCOUNTANT_REPORT_TYPES = {
+    "🌰 Закупки сырья (отчёт)": "raw",
     "📦 Расходники (отчёт)": "consumables",
     "💵 Зарплаты (отчёт)": "salary",
-    "💰 Оплаты (отчёт)": "payments",
+    "📉 Прочие расходы (отчёт)": "other",
 }
 
 
@@ -866,21 +945,23 @@ def build_category_report_text(title: str, rows: list) -> str:
     return "\n".join(lines)
 
 
-def build_payments_report_text(rows: list) -> str:
+def build_other_expenses_report_text(rows: list) -> str:
+    title = "📉 Прочие расходы склада"
     if not rows:
-        return "💰 Оплаты\n\nЗа период ничего не найдено."
-    lines = ["💰 Оплаты\n"]
+        return f"{title}\n\nЗа период ничего не найдено."
+    lines = [f"{title}\n"]
     total = 0.0
     for r in rows:
-        amount = abs(float(r["amount"]))
+        amount = float(r["amount"])
         total += amount
-        lines.append(f"▫️ {r.get('operation_date')} | {_cp_name(r)} | {amount:.2f}₽ | {r.get('payment_method') or '—'}")
+        cat_name = (r.get("categories") or {}).get("name") or "—"
+        lines.append(f"▫️ {r.get('operation_date')} | {cat_name} | {r.get('comment') or '—'} | {amount:.2f}₽ | {_cp_name(r)}")
     lines.append(f"\n💰 Итого: {round(total,2)}₽")
     return "\n".join(lines)
 
 
 async def accountant_report_start(update, context):
-    if update.effective_user.id != ACCOUNTANT_ID:
+    if context.bot_data["db"].get_dynamic_role(update.effective_user.id) != "accountant":
         return ConversationHandler.END
     t = update.message.text.strip()
     report_type = ACCOUNTANT_REPORT_TYPES.get(t)
@@ -896,19 +977,22 @@ async def accountant_report_start(update, context):
 async def _run_accountant_report(update, context, date_from, date_to):
     db = context.bot_data["db"]
     report_type = context.user_data.get("acc_report_type")
+    raw_cat_id = db.get_category_id("Закупка сырья (орехи/сухофрукты)")
+    consumables_cat_id = db.get_category_id("Расходники (упаковка, скотч, этикетки)")
 
-    if report_type == "consumables":
-        cat_id = db.get_category_id("Расходники (упаковка, скотч, этикетки)")
-        text = build_category_report_text("📦 Расходники", db.get_category_report_rows(cat_id, date_from, date_to))
+    if report_type == "raw":
+        text = build_category_report_text("🌰 Закупки сырья", db.get_category_report_rows(raw_cat_id, date_from, date_to))
+    elif report_type == "consumables":
+        text = build_category_report_text("📦 Расходники", db.get_category_report_rows(consumables_cat_id, date_from, date_to))
     elif report_type == "salary":
         cat_id = db.get_category_id("Зарплата")
         text = build_category_report_text("💵 Зарплаты", db.get_category_report_rows(cat_id, date_from, date_to))
-    elif report_type == "payments":
-        text = build_payments_report_text(db.get_payments_report_rows(date_from, date_to))
+    elif report_type == "other":
+        text = build_other_expenses_report_text(db.get_other_warehouse_expenses_rows([raw_cat_id, consumables_cat_id], date_from, date_to))
     else:
         text = "⚠️ Не понял тип отчёта, начните заново."
 
-    await update.message.reply_text(text, reply_markup=get_menu_keyboard(update.effective_user.id))
+    await update.message.reply_text(text, reply_markup=get_menu_keyboard(update.effective_user.id, db))
 
 
 async def accountant_report_period(update, context):
@@ -963,7 +1047,7 @@ def main():
             SUPPLY_ADD_MORE: [MessageHandler(filters.TEXT & ~filters.COMMAND, supply_add_more)],
             SUPPLY_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, supply_comment)],
             SUPPLY_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, supply_confirm)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Расходники|👤 Сотрудники|💰 Оплата|📊 Отчёт за период|💵 Мой оклад|📦 Расходники \(отчёт\)|💵 Зарплаты \(отчёт\)|💰 Оплаты \(отчёт\))$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Расходники|👤 Сотрудники|💰 Оплата|📊 Отчёт за период|💵 Мой оклад|🌰 Закупки сырья \(отчёт\)|📦 Расходники \(отчёт\)|💵 Зарплаты \(отчёт\)|📉 Прочие расходы \(отчёт\))$"), cancel_to_menu)]
     )
 
     pack_conv = ConversationHandler(
@@ -982,19 +1066,19 @@ def main():
             ACCRUAL_EMPLOYEE: [MessageHandler(filters.TEXT & ~filters.COMMAND, accrual_employee)],
             ACCRUAL_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, accrual_amount)],
             ACCRUAL_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, accrual_confirm)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Расходники|👤 Сотрудники|💰 Оплата|📊 Отчёт за период|💵 Мой оклад|📦 Расходники \(отчёт\)|💵 Зарплаты \(отчёт\)|💰 Оплаты \(отчёт\))$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Расходники|👤 Сотрудники|💰 Оплата|📊 Отчёт за период|💵 Мой оклад|🌰 Закупки сырья \(отчёт\)|📦 Расходники \(отчёт\)|💵 Зарплаты \(отчёт\)|📉 Прочие расходы \(отчёт\))$"), cancel_to_menu)]
     )
 
     report_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^📊 Отчёт за период$"), report_start)],
         states={REPORT_PERIOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, report_period)]},
-        fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Расходники|👤 Сотрудники|💰 Оплата|📊 Отчёт за период|💵 Мой оклад|📦 Расходники \(отчёт\)|💵 Зарплаты \(отчёт\)|💰 Оплаты \(отчёт\))$"), cancel_to_menu)]
+        fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Расходники|👤 Сотрудники|💰 Оплата|📊 Отчёт за период|💵 Мой оклад|🌰 Закупки сырья \(отчёт\)|📦 Расходники \(отчёт\)|💵 Зарплаты \(отчёт\)|📉 Прочие расходы \(отчёт\))$"), cancel_to_menu)]
     )
 
     salary_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^💵 Мой оклад$"), salary_start)],
         states={SALARY_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, salary_confirm)]},
-        fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Расходники|👤 Сотрудники|💰 Оплата|📊 Отчёт за период|💵 Мой оклад|📦 Расходники \(отчёт\)|💵 Зарплаты \(отчёт\)|💰 Оплаты \(отчёт\))$"), cancel_to_menu)]
+        fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Расходники|👤 Сотрудники|💰 Оплата|📊 Отчёт за период|💵 Мой оклад|🌰 Закупки сырья \(отчёт\)|📦 Расходники \(отчёт\)|💵 Зарплаты \(отчёт\)|📉 Прочие расходы \(отчёт\))$"), cancel_to_menu)]
     )
 
     payment_conv = ConversationHandler(
@@ -1005,19 +1089,20 @@ def main():
             PAY_METHOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, payment_method)],
             PAY_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, payment_comment)],
             PAY_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, payment_confirm)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Расходники|👤 Сотрудники|💰 Оплата|📊 Отчёт за период|💵 Мой оклад|📦 Расходники \(отчёт\)|💵 Зарплаты \(отчёт\)|💰 Оплаты \(отчёт\))$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Расходники|👤 Сотрудники|💰 Оплата|📊 Отчёт за период|💵 Мой оклад|🌰 Закупки сырья \(отчёт\)|📦 Расходники \(отчёт\)|💵 Зарплаты \(отчёт\)|📉 Прочие расходы \(отчёт\))$"), cancel_to_menu)]
     )
 
     accountant_report_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex(r"^(📦 Расходники \(отчёт\)|💵 Зарплаты \(отчёт\)|💰 Оплаты \(отчёт\))$"), accountant_report_start)],
+        entry_points=[MessageHandler(filters.Regex(r"^(🌰 Закупки сырья \(отчёт\)|📦 Расходники \(отчёт\)|💵 Зарплаты \(отчёт\)|📉 Прочие расходы \(отчёт\))$"), accountant_report_start)],
         states={
             ACC_REPORT_PERIOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, accountant_report_period)],
             ACC_REPORT_PERIOD_CUSTOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, accountant_report_period_custom)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Расходники|👤 Сотрудники|💰 Оплата|📊 Отчёт за период|💵 Мой оклад|📦 Расходники \(отчёт\)|💵 Зарплаты \(отчёт\)|💰 Оплаты \(отчёт\))$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Расходники|👤 Сотрудники|💰 Оплата|📊 Отчёт за период|💵 Мой оклад|🌰 Закупки сырья \(отчёт\)|📦 Расходники \(отчёт\)|💵 Зарплаты \(отчёт\)|📉 Прочие расходы \(отчёт\))$"), cancel_to_menu)]
     )
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_cmd))
+    application.add_handler(CallbackQueryHandler(access_request_callback, pattern="^db_(appr_acc|rej)_"))
     application.add_handler(supply_conv)
     application.add_handler(payment_conv)
     application.add_handler(pack_conv)
