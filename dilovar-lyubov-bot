@@ -107,15 +107,17 @@ class SupabaseService:
         )
         return res.data or []
 
-    def get_category_report_rows(self, category_id, date_from, date_to, operation_types=None):
+    def get_category_report_rows(self, category_id, date_from, date_to, operation_types=None, exclude_reversed=False):
         q = (
             self.client.table("operations")
-            .select("operation_date,item_name,quantity,price,amount,comment,counterparties(name)")
+            .select("operation_date,created_at,item_name,quantity,price,amount,comment,counterparties(name)")
             .eq("category_id", category_id)
             .gte("operation_date", date_from).lte("operation_date", date_to)
         )
         if operation_types:
             q = q.in_("operation_type", operation_types)
+        if exclude_reversed:
+            q = q.is_("reversed_by", "null")
         res = q.order("operation_date").execute()
         return res.data or []
 
@@ -143,6 +145,8 @@ class SupabaseService:
             self.client.table("operations")
             .select("operation_date,amount,comment,categories(name),counterparties(name)")
             .in_("category_id", cat_ids)
+            .neq("operation_type", "сторно")
+            .is_("reversed_by", "null")
             .gte("operation_date", date_from).lte("operation_date", date_to)
             .order("operation_date")
             .execute()
@@ -154,6 +158,11 @@ class SupabaseService:
         res = self.client.table("dilovar_bot_pending_users").select("role,status").eq("user_id", user_id).eq("status", "approved").limit(1).execute()
         data = res.data or []
         return data[0]["role"] if data else None
+
+    def get_approved_user_name(self, user_id: int):
+        res = self.client.table("dilovar_bot_pending_users").select("name").eq("user_id", user_id).eq("status", "approved").limit(1).execute()
+        data = res.data or []
+        return data[0].get("name") if data else None
 
     def get_access_request_status(self, user_id: int):
         res = self.client.table("dilovar_bot_pending_users").select("status").eq("user_id", user_id).limit(1).execute()
@@ -183,6 +192,22 @@ ACCOUNTANT_KEYBOARD = ReplyKeyboardMarkup(
     [["🌰 Закупки сырья (отчёт)", "📦 Расходники (отчёт)"], ["💵 Зарплаты (отчёт)", "📉 Прочие расходы (отчёт)"], ["💰 Оплаты поставщикам (отчёт)"], ["❓ Помощь"]],
     resize_keyboard=True,
 )
+
+
+def get_user_display_name(user_id, db=None):
+    if user_id == DILOVAR_ID:
+        return "Диловар"
+    if user_id == RAHMATJON_ID:
+        return "Рахматджон"
+    if user_id == LYUBOV_ID:
+        return "Любовь"
+    if user_id == ADMIN_NOTIFY_ID:
+        return "Админ"
+    if db is not None:
+        name = db.get_approved_user_name(user_id)
+        if name:
+            return name
+    return "Бухгалтер"
 
 
 def get_menu_keyboard(user_id, db=None):
@@ -459,12 +484,13 @@ async def supply_confirm(update, context):
     category_id = db.get_category_id("Расходники (упаковка, скотч, этикетки)")
     op_date = datetime.now(TZ_MSK).date().isoformat()
 
+    entered_name = get_user_display_name(update.effective_user.id, db)
     for item in d["s_items"]:
         op_id = db.add_operation_returning_id(
             operation_date=op_date, ip_id=None, counterparty_id=(cp or {}).get("id"),
             category_id=category_id, operation_type="покупка", amount=item["total"],
             quantity=item["qty"], price=item["price"], item_name=item["product"],
-            entered_by=f"dilovar_{update.effective_user.id}", status="confirmed",
+            entered_by=f"{entered_name}_{update.effective_user.id}", status="confirmed",
             payment_method=None, comment=d["s_comment"],
         )
         db.add_warehouse_movement(
@@ -473,12 +499,12 @@ async def supply_confirm(update, context):
             counterparty_id=(cp or {}).get("id"), ip_id=None, marketplace=None, note=d["s_comment"],
         )
         db.post_journal_entry(operation_id=op_id, entry_date=op_date, debit_code="1200", credit_code="2000",
-                               amount=item["total"], comment=f"Закупка (Диловар): {item['product']}")
+                               amount=item["total"], comment=f"Закупка ({entered_name}): {item['product']}")
 
     total = round(sum(it["total"] for it in d["s_items"]), 2)
     await update.message.reply_text(f"✅ Занесено: {len(d['s_items'])} поз. на {total}₽.", reply_markup=get_menu_keyboard(update.effective_user.id))
     if ADMIN_NOTIFY_ID:
-        await context.bot.send_message(chat_id=ADMIN_NOTIFY_ID, text=f"📦 Диловар внёс закупку расходников: {total}₽ ({d['s_supplier']})")
+        await context.bot.send_message(chat_id=ADMIN_NOTIFY_ID, text=f"📦 {entered_name} внёс закупку расходников: {total}₽ ({d['s_supplier']})")
     return ConversationHandler.END
 
 
@@ -608,17 +634,18 @@ async def shift_confirm(update, context):
     if t != "✅ Подтвердить": return await cancel_to_menu(update, context)
     db, d = context.bot_data["db"], context.user_data
     category_id = db.get_category_id("Зарплата")
-    comment = f"Смена {d['shift_date_display']} {d['shift_start_time']}–{d['shift_end_time']} ({d['shift_hours']}ч), внёс Диловар"
+    entered_name = get_user_display_name(update.effective_user.id, db)
+    comment = f"Смена {d['shift_date_display']} {d['shift_start_time']}–{d['shift_end_time']} ({d['shift_hours']}ч), внёс {entered_name}"
     op_id = db.add_operation_returning_id(
         operation_date=d["shift_date_iso"], ip_id=None, counterparty_id=d["shift_emp_id"],
         category_id=category_id, operation_type="начисление", amount=d["shift_total"],
-        entered_by=f"dilovar_{update.effective_user.id}", status="confirmed", payment_method=None, comment=comment,
+        entered_by=f"{entered_name}_{update.effective_user.id}", status="confirmed", payment_method=None, comment=comment,
     )
     db.post_journal_entry(operation_id=op_id, entry_date=d["shift_date_iso"], debit_code="5100", credit_code="2100",
                            amount=d["shift_total"], comment=f"Начисление {d['shift_emp_name']} (смена)")
     await update.message.reply_text(f"✅ Начислено {d['shift_total']}₽ для {d['shift_emp_name']}.", reply_markup=get_menu_keyboard(update.effective_user.id))
     if ADMIN_NOTIFY_ID:
-        await context.bot.send_message(chat_id=ADMIN_NOTIFY_ID, text=f"🕐 Диловар внёс смену {d['shift_emp_name']}: {d['shift_date_display']} {d['shift_start_time']}–{d['shift_end_time']} → {d['shift_total']}₽")
+        await context.bot.send_message(chat_id=ADMIN_NOTIFY_ID, text=f"🕐 {entered_name} внёс смену {d['shift_emp_name']}: {d['shift_date_display']} {d['shift_start_time']}–{d['shift_end_time']} → {d['shift_total']}₽")
     return ConversationHandler.END
 
 
@@ -653,17 +680,18 @@ async def accrual_confirm(update, context):
     db, d = context.bot_data["db"], context.user_data
     category_id = db.get_category_id("Зарплата")
     op_date = datetime.now(TZ_MSK).date().isoformat()
+    entered_name = get_user_display_name(update.effective_user.id, db)
     op_id = db.add_operation_returning_id(
         operation_date=op_date, ip_id=None, counterparty_id=d["accrual_emp_id"],
         category_id=category_id, operation_type="начисление", amount=d["accrual_amount"],
-        entered_by=f"dilovar_{update.effective_user.id}", status="confirmed", payment_method=None,
-        comment=f"Начисление оклада (внёс Диловар)",
+        entered_by=f"{entered_name}_{update.effective_user.id}", status="confirmed", payment_method=None,
+        comment=f"Начисление оклада (внёс {entered_name})",
     )
     db.post_journal_entry(operation_id=op_id, entry_date=op_date, debit_code="5100", credit_code="2100",
                            amount=d["accrual_amount"], comment=f"Начисление {d['accrual_emp_name']}")
     await update.message.reply_text(f"✅ Начислено {d['accrual_amount']}₽ для {d['accrual_emp_name']}.", reply_markup=get_menu_keyboard(update.effective_user.id))
     if ADMIN_NOTIFY_ID:
-        await context.bot.send_message(chat_id=ADMIN_NOTIFY_ID, text=f"💵 Диловар начислил {d['accrual_emp_name']}: {d['accrual_amount']}₽")
+        await context.bot.send_message(chat_id=ADMIN_NOTIFY_ID, text=f"💵 {entered_name} начислил {d['accrual_emp_name']}: {d['accrual_amount']}₽")
     return ConversationHandler.END
 
 
@@ -759,18 +787,19 @@ async def pack_confirm(update, context):
 
     category_id = db.get_category_id("Зарплата")
     emp_name = d["pack_employee_name"]
+    entered_name = get_user_display_name(update.effective_user.id, db)
     op_id = db.add_operation_returning_id(
         operation_date=d["pack_date_iso"], ip_id=None, counterparty_id=d["pack_employee_id"],
         category_id=category_id, operation_type="начисление", amount=amount,
-        quantity=d["pack_units"], entered_by=f"dilovar_{update.effective_user.id}",
+        quantity=d["pack_units"], entered_by=f"{entered_name}_{update.effective_user.id}",
         status="confirmed", payment_method=None,
-        comment=f"Упаковка {d['pack_date_display']}: {d['pack_units']} шт ({d.get('pack_per_unit_cost','?')}₽/шт труд), внёс Диловар",
+        comment=f"Упаковка {d['pack_date_display']}: {d['pack_units']} шт ({d.get('pack_per_unit_cost','?')}₽/шт труд), внёс {entered_name}",
     )
     db.post_journal_entry(operation_id=op_id, entry_date=d["pack_date_iso"], debit_code="5100", credit_code="2100",
                            amount=amount, comment=f"Начисление {emp_name} (упаковка {d['pack_date_display']})")
     await update.message.reply_text(f"✅ Начислено {amount}₽ для {emp_name} за {d['pack_date_display']}.", reply_markup=get_menu_keyboard(update.effective_user.id))
     if ADMIN_NOTIFY_ID:
-        await context.bot.send_message(chat_id=ADMIN_NOTIFY_ID, text=f"🕐 Диловар внёс упаковку {emp_name}: {d['pack_units']} шт за {d['pack_date_display']} → начислено {amount}₽")
+        await context.bot.send_message(chat_id=ADMIN_NOTIFY_ID, text=f"🕐 {entered_name} внёс упаковку {emp_name}: {d['pack_units']} шт за {d['pack_date_display']} → начислено {amount}₽")
     return ConversationHandler.END
 
 
@@ -827,16 +856,17 @@ async def salary_confirm(update, context):
     cp = db.get_counterparty_by_name("Любовь")
     category_id = db.get_category_id("Зарплата")
     op_date = datetime.now(TZ_MSK).date().isoformat()
+    entered_name = get_user_display_name(update.effective_user.id, db)
     op_id = db.add_operation_returning_id(
         operation_date=op_date, ip_id=None, counterparty_id=(cp or {}).get("id"),
         category_id=category_id, operation_type="начисление", amount=6000,
-        entered_by=f"lyubov_{update.effective_user.id}", status="confirmed",
+        entered_by=f"{entered_name}_{update.effective_user.id}", status="confirmed",
         payment_method=None, comment="Оклад Любовь",
     )
     db.post_journal_entry(operation_id=op_id, entry_date=op_date, debit_code="5100", credit_code="2100", amount=6000, comment="Начисление оклада Любовь")
     await update.message.reply_text("✅ Начислено 6 000₽.", reply_markup=get_menu_keyboard(update.effective_user.id))
     if ADMIN_NOTIFY_ID:
-        await context.bot.send_message(chat_id=ADMIN_NOTIFY_ID, text="💵 Любовь начислила себе оклад 6 000₽.")
+        await context.bot.send_message(chat_id=ADMIN_NOTIFY_ID, text=f"💵 {entered_name} начислил(а) оклад Любови: 6 000₽.")
     return ConversationHandler.END
 
 
@@ -912,19 +942,20 @@ async def payment_confirm(update, context):
     cp = db.get_counterparty_by_name(d["pay_supplier"])
     category_name = "Зарплата" if d["pay_cp_type"] == "сотрудник" else "Расходники (упаковка, скотч, этикетки)"
     op_date = datetime.now(TZ_MSK).date().isoformat()
+    entered_name = get_user_display_name(update.effective_user.id, db)
     op_id = db.add_operation_returning_id(
         operation_date=op_date, ip_id=None, counterparty_id=(cp or {}).get("id"),
         category_id=db.get_category_id(category_name), operation_type="оплата", amount=-d["pay_amount"],
-        entered_by=f"dilovar_{update.effective_user.id}", status="confirmed",
+        entered_by=f"{entered_name}_{update.effective_user.id}", status="confirmed",
         payment_method=d["pay_method"], comment=d["pay_comment"],
     )
     payables_code = "2100" if d["pay_cp_type"] == "сотрудник" else "2000"
     cash_code = "1000" if d["pay_method"] == "Наличные" else "1010"
     db.post_journal_entry(operation_id=op_id, entry_date=op_date, debit_code=payables_code, credit_code=cash_code,
-                           amount=d["pay_amount"], comment=f"Оплата: {d['pay_supplier']} ({d['pay_method']}), внёс Диловар")
+                           amount=d["pay_amount"], comment=f"Оплата: {d['pay_supplier']} ({d['pay_method']}), внёс {entered_name}")
     await update.message.reply_text("✅ Оплата сохранена.", reply_markup=get_menu_keyboard(update.effective_user.id))
     if ADMIN_NOTIFY_ID:
-        await context.bot.send_message(chat_id=ADMIN_NOTIFY_ID, text=f"💰 Диловар внёс оплату: {d['pay_supplier']} — {d['pay_amount']}₽ ({d['pay_method']})")
+        await context.bot.send_message(chat_id=ADMIN_NOTIFY_ID, text=f"💰 {entered_name} внёс оплату: {d['pay_supplier']} — {d['pay_amount']}₽ ({d['pay_method']})")
     return ConversationHandler.END
 
 
@@ -973,6 +1004,22 @@ def build_category_report_text(title: str, rows: list, qty_unit: str = "шт", u
     return "\n".join(lines)
 
 
+def build_salary_report_text(rows: list) -> str:
+    title = "💵 Зарплаты"
+    if not rows:
+        return f"{title}\n\nЗа период ничего не найдено."
+    lines = [f"{title}\n"]
+    total = 0.0
+    for r in rows:
+        amount = float(r["amount"])
+        total += amount
+        entered_date = _fmt_date_ru(r["created_at"]) if r.get("created_at") else "—"
+        shift_date = _fmt_date_ru(r["operation_date"])
+        lines.append(f"▫️ {entered_date} | смена: {shift_date} | {amount:.2f}₽ | {_cp_name(r)}")
+    lines.append(f"\n💰 Итого: {round(total,2)}₽")
+    return "\n".join(lines)
+
+
 def build_other_expenses_report_text(rows: list) -> str:
     title = "📉 Прочие расходы склада"
     if not rows:
@@ -983,7 +1030,7 @@ def build_other_expenses_report_text(rows: list) -> str:
         amount = float(r["amount"])
         total += amount
         cat_name = (r.get("categories") or {}).get("name") or "—"
-        lines.append(f"▫️ {_fmt_date_ru(r['operation_date'])} | {cat_name} | {r.get('comment') or '—'} | {amount:.2f}₽ | {_cp_name(r)}")
+        lines.append(f"▫️ {_fmt_date_ru(r['operation_date'])} | {cat_name} | {amount:.2f}₽")
     lines.append(f"\n💰 Итого: {round(total,2)}₽")
     return "\n".join(lines)
 
@@ -1043,8 +1090,8 @@ async def _run_accountant_report(update, context, date_from, date_to):
         text = build_category_report_text("📦 Расходники", rows, qty_unit="шт")
     elif report_type == "salary":
         cat_id = db.get_category_id("Зарплата")
-        rows = db.get_category_report_rows(cat_id, date_from, date_to, operation_types=["начисление", "сторно"])
-        text = build_category_report_text("💵 Зарплаты", rows, qty_unit="шт")
+        rows = db.get_category_report_rows(cat_id, date_from, date_to, operation_types=["начисление"], exclude_reversed=True)
+        text = build_salary_report_text(rows)
     elif report_type == "other":
         text = build_other_expenses_report_text(db.get_other_warehouse_expenses_rows([raw_cat_id, consumables_cat_id], date_from, date_to))
     elif report_type == "supplier_payments":
