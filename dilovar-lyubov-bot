@@ -107,13 +107,27 @@ class SupabaseService:
         )
         return res.data or []
 
-    def get_category_report_rows(self, category_id, date_from, date_to):
-        res = (
+    def get_category_report_rows(self, category_id, date_from, date_to, operation_types=None):
+        q = (
             self.client.table("operations")
             .select("operation_date,item_name,quantity,price,amount,comment,counterparties(name)")
             .eq("category_id", category_id)
             .gte("operation_date", date_from).lte("operation_date", date_to)
+        )
+        if operation_types:
+            q = q.in_("operation_type", operation_types)
+        res = q.order("operation_date").execute()
+        return res.data or []
+
+    def get_supplier_ledger_rows(self, counterparty_ids):
+        if not counterparty_ids:
+            return []
+        res = (
+            self.client.table("operations")
+            .select("id,operation_date,operation_type,amount,counterparty_id,counterparties(name)")
+            .in_("counterparty_id", counterparty_ids)
             .order("operation_date")
+            .order("id")
             .execute()
         )
         return res.data or []
@@ -166,7 +180,7 @@ RULES_TEXT = "🛑 Числа вводим без букв (просто `500`).
 
 
 ACCOUNTANT_KEYBOARD = ReplyKeyboardMarkup(
-    [["🌰 Закупки сырья (отчёт)", "📦 Расходники (отчёт)"], ["💵 Зарплаты (отчёт)", "📉 Прочие расходы (отчёт)"], ["❓ Помощь"]],
+    [["🌰 Закупки сырья (отчёт)", "📦 Расходники (отчёт)"], ["💵 Зарплаты (отчёт)", "📉 Прочие расходы (отчёт)"], ["💰 Оплаты поставщикам (отчёт)"], ["❓ Помощь"]],
     resize_keyboard=True,
 )
 
@@ -920,7 +934,10 @@ ACCOUNTANT_REPORT_TYPES = {
     "📦 Расходники (отчёт)": "consumables",
     "💵 Зарплаты (отчёт)": "salary",
     "📉 Прочие расходы (отчёт)": "other",
+    "💰 Оплаты поставщикам (отчёт)": "supplier_payments",
 }
+
+SUPPLIER_COUNTERPARTY_TYPES = ["поставщик сырья", "поставщик расходников"]
 
 
 def _cp_name(row: dict) -> str:
@@ -928,7 +945,17 @@ def _cp_name(row: dict) -> str:
     return (cp or {}).get("name") or "—"
 
 
-def build_category_report_text(title: str, rows: list) -> str:
+def _fmt_date_ru(iso_date: str) -> str:
+    return datetime.strptime(iso_date[:10], "%Y-%m-%d").strftime("%d.%m.%Y")
+
+
+def _fmt_amount_ru(x: float) -> str:
+    x = round(x, 2)
+    s = f"{x:,.0f}" if x == int(x) else f"{x:,.2f}"
+    return s.replace(",", " ")
+
+
+def build_category_report_text(title: str, rows: list, qty_unit: str = "шт", use_comment_fallback: bool = True) -> str:
     if not rows:
         return f"{title}\n\nЗа период ничего не найдено."
     lines = [f"{title}\n"]
@@ -937,10 +964,11 @@ def build_category_report_text(title: str, rows: list) -> str:
         amount = float(r["amount"])
         total += amount
         qty = r.get("quantity")
-        qty_str = f"{float(qty):.0f} шт" if qty is not None else "—"
+        qty_str = f"{float(qty):.0f} {qty_unit}" if qty is not None else "—"
         price = r.get("price")
-        price_str = f"{float(price):.2f}₽/шт" if price is not None else "—"
-        lines.append(f"▫️ {r.get('operation_date')} | {r.get('item_name') or r.get('comment') or '—'} | {qty_str} | {price_str} | {amount:.2f}₽ | {_cp_name(r)}")
+        price_str = f"{float(price):.2f}₽/{qty_unit}" if price is not None else "—"
+        item = r.get("item_name") or (r.get("comment") if use_comment_fallback else None) or "—"
+        lines.append(f"▫️ {_fmt_date_ru(r['operation_date'])} | {item} | {qty_str} | {price_str} | {amount:.2f}₽ | {_cp_name(r)}")
     lines.append(f"\n💰 Итого: {round(total,2)}₽")
     return "\n".join(lines)
 
@@ -955,8 +983,35 @@ def build_other_expenses_report_text(rows: list) -> str:
         amount = float(r["amount"])
         total += amount
         cat_name = (r.get("categories") or {}).get("name") or "—"
-        lines.append(f"▫️ {r.get('operation_date')} | {cat_name} | {r.get('comment') or '—'} | {amount:.2f}₽ | {_cp_name(r)}")
+        lines.append(f"▫️ {_fmt_date_ru(r['operation_date'])} | {cat_name} | {r.get('comment') or '—'} | {amount:.2f}₽ | {_cp_name(r)}")
     lines.append(f"\n💰 Итого: {round(total,2)}₽")
+    return "\n".join(lines)
+
+
+def build_supplier_payments_report_text(ledger_rows: list, date_from: str, date_to: str) -> str:
+    title = "💰 Оплаты поставщикам"
+    balances = {}
+    payments = []
+    for r in ledger_rows:
+        cp_id = r["counterparty_id"]
+        balances[cp_id] = balances.get(cp_id, 0.0) + float(r["amount"])
+        op_date = r["operation_date"][:10]
+        if r["operation_type"] == "оплата" and date_from <= op_date <= date_to:
+            payments.append({
+                "date": r["operation_date"],
+                "amount": float(r["amount"]),
+                "supplier": _cp_name(r),
+                "balance_after": balances[cp_id],
+            })
+    if not payments:
+        return f"{title}\n\nЗа период ничего не найдено."
+    payments.sort(key=lambda p: p["date"])
+    lines = [f"{title}\n"]
+    total = 0.0
+    for p in payments:
+        total += p["amount"]
+        lines.append(f"▫️ {_fmt_date_ru(p['date'])} | {_fmt_amount_ru(p['amount'])}₽ | {p['supplier']} | остаток: {_fmt_amount_ru(p['balance_after'])}₽")
+    lines.append(f"\n💰 Итого выплачено: {_fmt_amount_ru(abs(total))}₽")
     return "\n".join(lines)
 
 
@@ -981,14 +1036,20 @@ async def _run_accountant_report(update, context, date_from, date_to):
     consumables_cat_id = db.get_category_id("Расходники (упаковка, скотч, этикетки)")
 
     if report_type == "raw":
-        text = build_category_report_text("🌰 Закупки сырья", db.get_category_report_rows(raw_cat_id, date_from, date_to))
+        rows = db.get_category_report_rows(raw_cat_id, date_from, date_to, operation_types=["покупка"])
+        text = build_category_report_text("🌰 Закупки сырья", rows, qty_unit="кг", use_comment_fallback=False)
     elif report_type == "consumables":
-        text = build_category_report_text("📦 Расходники", db.get_category_report_rows(consumables_cat_id, date_from, date_to))
+        rows = db.get_category_report_rows(consumables_cat_id, date_from, date_to, operation_types=["покупка"])
+        text = build_category_report_text("📦 Расходники", rows, qty_unit="шт")
     elif report_type == "salary":
         cat_id = db.get_category_id("Зарплата")
-        text = build_category_report_text("💵 Зарплаты", db.get_category_report_rows(cat_id, date_from, date_to))
+        rows = db.get_category_report_rows(cat_id, date_from, date_to, operation_types=["начисление", "сторно"])
+        text = build_category_report_text("💵 Зарплаты", rows, qty_unit="шт")
     elif report_type == "other":
         text = build_other_expenses_report_text(db.get_other_warehouse_expenses_rows([raw_cat_id, consumables_cat_id], date_from, date_to))
+    elif report_type == "supplier_payments":
+        supplier_ids = [s["id"] for t in SUPPLIER_COUNTERPARTY_TYPES for s in db.get_suppliers_list(type_filter=t)]
+        text = build_supplier_payments_report_text(db.get_supplier_ledger_rows(supplier_ids), date_from, date_to)
     else:
         text = "⚠️ Не понял тип отчёта, начните заново."
 
@@ -1047,7 +1108,7 @@ def main():
             SUPPLY_ADD_MORE: [MessageHandler(filters.TEXT & ~filters.COMMAND, supply_add_more)],
             SUPPLY_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, supply_comment)],
             SUPPLY_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, supply_confirm)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Расходники|👤 Сотрудники|💰 Оплата|📊 Отчёт за период|💵 Мой оклад|🌰 Закупки сырья \(отчёт\)|📦 Расходники \(отчёт\)|💵 Зарплаты \(отчёт\)|📉 Прочие расходы \(отчёт\))$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Расходники|👤 Сотрудники|💰 Оплата|📊 Отчёт за период|💵 Мой оклад|🌰 Закупки сырья \(отчёт\)|📦 Расходники \(отчёт\)|💵 Зарплаты \(отчёт\)|📉 Прочие расходы \(отчёт\)|💰 Оплаты поставщикам \(отчёт\))$"), cancel_to_menu)]
     )
 
     pack_conv = ConversationHandler(
@@ -1066,19 +1127,19 @@ def main():
             ACCRUAL_EMPLOYEE: [MessageHandler(filters.TEXT & ~filters.COMMAND, accrual_employee)],
             ACCRUAL_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, accrual_amount)],
             ACCRUAL_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, accrual_confirm)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Расходники|👤 Сотрудники|💰 Оплата|📊 Отчёт за период|💵 Мой оклад|🌰 Закупки сырья \(отчёт\)|📦 Расходники \(отчёт\)|💵 Зарплаты \(отчёт\)|📉 Прочие расходы \(отчёт\))$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Расходники|👤 Сотрудники|💰 Оплата|📊 Отчёт за период|💵 Мой оклад|🌰 Закупки сырья \(отчёт\)|📦 Расходники \(отчёт\)|💵 Зарплаты \(отчёт\)|📉 Прочие расходы \(отчёт\)|💰 Оплаты поставщикам \(отчёт\))$"), cancel_to_menu)]
     )
 
     report_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^📊 Отчёт за период$"), report_start)],
         states={REPORT_PERIOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, report_period)]},
-        fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Расходники|👤 Сотрудники|💰 Оплата|📊 Отчёт за период|💵 Мой оклад|🌰 Закупки сырья \(отчёт\)|📦 Расходники \(отчёт\)|💵 Зарплаты \(отчёт\)|📉 Прочие расходы \(отчёт\))$"), cancel_to_menu)]
+        fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Расходники|👤 Сотрудники|💰 Оплата|📊 Отчёт за период|💵 Мой оклад|🌰 Закупки сырья \(отчёт\)|📦 Расходники \(отчёт\)|💵 Зарплаты \(отчёт\)|📉 Прочие расходы \(отчёт\)|💰 Оплаты поставщикам \(отчёт\))$"), cancel_to_menu)]
     )
 
     salary_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^💵 Мой оклад$"), salary_start)],
         states={SALARY_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, salary_confirm)]},
-        fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Расходники|👤 Сотрудники|💰 Оплата|📊 Отчёт за период|💵 Мой оклад|🌰 Закупки сырья \(отчёт\)|📦 Расходники \(отчёт\)|💵 Зарплаты \(отчёт\)|📉 Прочие расходы \(отчёт\))$"), cancel_to_menu)]
+        fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Расходники|👤 Сотрудники|💰 Оплата|📊 Отчёт за период|💵 Мой оклад|🌰 Закупки сырья \(отчёт\)|📦 Расходники \(отчёт\)|💵 Зарплаты \(отчёт\)|📉 Прочие расходы \(отчёт\)|💰 Оплаты поставщикам \(отчёт\))$"), cancel_to_menu)]
     )
 
     payment_conv = ConversationHandler(
@@ -1089,15 +1150,15 @@ def main():
             PAY_METHOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, payment_method)],
             PAY_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, payment_comment)],
             PAY_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, payment_confirm)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Расходники|👤 Сотрудники|💰 Оплата|📊 Отчёт за период|💵 Мой оклад|🌰 Закупки сырья \(отчёт\)|📦 Расходники \(отчёт\)|💵 Зарплаты \(отчёт\)|📉 Прочие расходы \(отчёт\))$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Расходники|👤 Сотрудники|💰 Оплата|📊 Отчёт за период|💵 Мой оклад|🌰 Закупки сырья \(отчёт\)|📦 Расходники \(отчёт\)|💵 Зарплаты \(отчёт\)|📉 Прочие расходы \(отчёт\)|💰 Оплаты поставщикам \(отчёт\))$"), cancel_to_menu)]
     )
 
     accountant_report_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex(r"^(🌰 Закупки сырья \(отчёт\)|📦 Расходники \(отчёт\)|💵 Зарплаты \(отчёт\)|📉 Прочие расходы \(отчёт\))$"), accountant_report_start)],
+        entry_points=[MessageHandler(filters.Regex(r"^(🌰 Закупки сырья \(отчёт\)|📦 Расходники \(отчёт\)|💵 Зарплаты \(отчёт\)|📉 Прочие расходы \(отчёт\)|💰 Оплаты поставщикам \(отчёт\))$"), accountant_report_start)],
         states={
             ACC_REPORT_PERIOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, accountant_report_period)],
             ACC_REPORT_PERIOD_CUSTOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, accountant_report_period_custom)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Расходники|👤 Сотрудники|💰 Оплата|📊 Отчёт за период|💵 Мой оклад|🌰 Закупки сырья \(отчёт\)|📦 Расходники \(отчёт\)|💵 Зарплаты \(отчёт\)|📉 Прочие расходы \(отчёт\))$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Расходники|👤 Сотрудники|💰 Оплата|📊 Отчёт за период|💵 Мой оклад|🌰 Закупки сырья \(отчёт\)|📦 Расходники \(отчёт\)|💵 Зарплаты \(отчёт\)|📉 Прочие расходы \(отчёт\)|💰 Оплаты поставщикам \(отчёт\))$"), cancel_to_menu)]
     )
 
     application.add_handler(CommandHandler("start", start))
